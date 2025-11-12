@@ -3,7 +3,7 @@ pragma solidity 0.8.25;
 
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {IMorpho, IMorphoBase, MarketParams, Id, Position, Market} from "./interfaces/IMorpho.sol";
-import {IMorphoSupplyCollateralCallback} from "./interfaces/IMorphoCallbacks.sol";
+import {IMorphoSupplyCollateralCallback, IMorphoRepayCallback} from "./interfaces/IMorphoCallbacks.sol";
 import {IWstETH} from "./interfaces/IWstETH.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Wrapper} from "./Wrapper.sol";
@@ -16,16 +16,15 @@ import {IDashboard} from "./interfaces/IDashboard.sol";
 ///
 /// TODO PRODUCTION: Critical items before mainnet deployment
 /// 1. ACCESS CONTROL: Add OpenZeppelin Ownable/AccessControl to admin functions
-/// 2. EXIT FLOW: Implement exit using IMorphoRepayCallback for atomic unwinding
-/// 3. ORACLE INTEGRATION: Use Morpho's oracle for accurate price feeds in health checks
-/// 4. SLIPPAGE PROTECTION: Add min/max amount checks on wstETH minting
+/// 2. ORACLE INTEGRATION: Use Morpho's oracle for accurate price feeds in health checks
+/// 4. SLIPPAGE PROTECTION: Add min/max amount checks on wstETH minting and unwrapping
 /// 5. REENTRANCY GUARDS: Add ReentrancyGuard to all external functions
 /// 6. PAUSE MECHANISM: Add circuit breaker for emergency situations
 /// 7. COMPREHENSIVE TESTING: Unit tests, integration tests, fuzzing, formal verification
 /// 8. GAS OPTIMIZATION: Optimize storage layout and function calls
 /// 9. LIQUIDATION PROTECTION: Add monitoring and keeper system for position health
 /// 10. AUDIT: Complete security audit by reputable firm
-contract MorphoLoopedStrategy is IStrategy, IMorphoSupplyCollateralCallback {
+contract MorphoLoopedStrategy is IStrategy, IMorphoSupplyCollateralCallback, IMorphoRepayCallback {
     /* CONSTANTS */
     uint256 private constant WAD = 1e18;
     uint256 private constant ORACLE_PRICE_SCALE = 1e36;
@@ -288,33 +287,42 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoSupplyCollateralCallback {
         uint256 debtToRepay = position.borrowedAmount;
         uint256 collateralToWithdraw = position.collateralAmount;
 
-        // TODO PRODUCTION: Implement exit flow using Morpho repay callback
-        // Flow should be:
-        // 1. Call MORPHO.repay() with callback
-        // 2. In onMorphoRepay callback:
-        //    - Withdraw collateral (debt already reduced)
-        //    - Unwrap wstETH to get ETH
-        //    - Swap ETH to WETH if needed
-        //    - Approve WETH for Morpho to pull for repayment
-        // 3. Position unwound atomically
+        // TODO PRODUCTION: Check if position can be safely exited
+        // - Verify no pending liquidation
+        // - Check withdrawal queue availability
+        // - Validate minimum output amounts
 
-        // For now, revert until exit flow is implemented
-        revert("Exit flow not implemented yet");
+        // Set callback context for exit
+        _callbackContext = CallbackContext({
+            user: user,
+            stvTokenShares: position.initialStvShares,
+            borrowAmount: debtToRepay,
+            isDeposit: false
+        });
 
-        // emit PositionClosed(user, collateralToWithdraw, debtToRepay);
+        // Call repay WITH callback
+        // Morpho will reduce our debt, THEN call onMorphoRepay
+        // where we withdraw collateral and provide WETH for repayment
+        bytes memory data = abi.encode(user, collateralToWithdraw);
+        MORPHO.repay(MARKET_PARAMS, debtToRepay, 0, address(this), data);
 
-        // // TODO PRODUCTION: Calculate actual return value considering:
-        // // - Accrued staking rewards
-        // // - Interest paid
-        // // - Fees
-        // // - Price impact from unwinding
-        // // Return initial shares (simplified - in production, calculate actual value)
-        // assets = position.initialStvShares;
+        // Clear callback context
+        delete _callbackContext;
 
-        // // Clean up position
-        // delete userPositions[user];
+        emit PositionClosed(user, collateralToWithdraw, debtToRepay);
 
-        // return assets;
+        // TODO PRODUCTION: Calculate actual return value considering:
+        // - Accrued staking rewards
+        // - Interest paid
+        // - Fees
+        // - Slippage from unwinding
+        // For now, return simplified value
+        assets = position.initialStvShares;
+
+        // Clean up position
+        delete userPositions[user];
+
+        return assets;
     }
 
     /// @notice Get borrow details for a user
@@ -407,6 +415,80 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoSupplyCollateralCallback {
 
         // TODO PRODUCTION: Verify all tokens were properly transferred
         // TODO PRODUCTION: Emit detailed callback execution event
+    }
+
+    /// @notice Callback function for Morpho repay
+    /// @param assets Amount of assets being repaid
+    /// @param data Encoded callback data
+    function onMorphoRepay(
+        uint256 assets,
+        bytes calldata data
+    ) external override {
+        require(msg.sender == address(MORPHO), "Unauthorized callback");
+
+        // TODO PRODUCTION: Add reentrancy protection
+        // TODO PRODUCTION: Verify callback context is valid
+
+        (address user, uint256 collateralAmount) = abi.decode(data, (address, uint256));
+
+        // At this point: Morpho has ALREADY reduced our debt
+        // We can now withdraw collateral and provide WETH for repayment
+
+        emit DebugLog("Repay callback - debt reduced", assets, collateralAmount);
+
+        // Step 1: Withdraw ALL wstETH collateral from Morpho
+        // (Debt is already reduced, so we can withdraw)
+        MORPHO.withdrawCollateral(
+            MARKET_PARAMS,
+            collateralAmount,
+            address(this),
+            address(this)
+        );
+
+        emit DebugLog("Collateral withdrawn", collateralAmount, 0);
+
+        // Step 2: Burn wstETH directly via Dashboard to get ETH back
+        // Dashboard.burnWstETH() burns wstETH and returns equivalent ETH
+        uint256 ethBalanceBefore = address(this).balance;
+
+        // First approve Dashboard to spend wstETH
+        WSTETH.approve(address(WRAPPER.DASHBOARD()), collateralAmount);
+
+        // Burn wstETH for ETH via Dashboard
+        IDashboard(payable(address(WRAPPER.DASHBOARD()))).burnWstETH(collateralAmount);
+
+        uint256 ethBalanceAfter = address(this).balance;
+        uint256 ethReceived = ethBalanceAfter - ethBalanceBefore;
+
+        emit DebugLog("wstETH burned to ETH", ethReceived, collateralAmount);
+
+        // Step 3: Calculate repayment amount and excess to return to user
+        uint256 ethForRepayment = assets; // Amount needed to repay debt
+        uint256 excessETH = ethReceived - ethForRepayment;
+
+        // Step 4: Wrap ETH → WETH for repayment
+        IWETH(address(LOAN_TOKEN)).deposit{value: ethForRepayment}();
+
+        emit DebugLog("ETH wrapped to WETH for repayment", ethForRepayment, excessETH);
+
+        // Step 5: Approve Morpho to pull WETH for repayment
+        // When this callback completes, Morpho will transfer the WETH
+        LOAN_TOKEN.approve(address(MORPHO), assets);
+
+        emit DebugLog("WETH approved for repayment", assets, 0);
+
+        // Step 6: Return excess ETH to user
+        if (excessETH > 0) {
+            (bool success, ) = payable(user).call{value: excessETH}("");
+            require(success, "ETH transfer failed");
+            emit DebugLog("Excess ETH returned to user", excessETH, 0);
+        }
+
+        // TODO PRODUCTION: Add slippage protection
+        // - Verify ethReceived is within acceptable range of expected value
+        // - Add min/max amount checks based on oracle prices
+
+        // TODO PRODUCTION: Emit detailed callback execution event with all amounts
     }
 
     /// @notice Interface for WETH unwrapping
