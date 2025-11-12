@@ -54,10 +54,19 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoSupplyCollateralCallback, IMo
     uint256 public minHealthFactor;
 
     /// @notice User positions mapping
+    /// @dev For proxy pattern: each proxy serves ONE user, so this will have at most 1 entry
     mapping(address => UserPosition) public userPositions;
 
     /// @notice Callback context for supply collateral callbacks
     CallbackContext private _callbackContext;
+
+    /// @notice Owner of this strategy (the user)
+    /// @dev For proxy pattern: set during initialize(), only this user can use this strategy
+    address public owner;
+
+    /// @notice Initialization flag to prevent re-initialization
+    /// @dev Critical for proxy security - ensures initialize() can only be called once
+    bool private _initialized;
 
     /* STRUCTS */
     struct UserPosition {
@@ -107,6 +116,10 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoSupplyCollateralCallback, IMo
     error PositionNotExiting();
     error UnhealthyPosition();
     error InvalidMarket();
+    error AlreadyInitialized();
+    error NotInitialized();
+    error Unauthorized();
+    error InvalidOwner();
 
     // TODO PRODUCTION: Add more specific errors
     // error Paused();
@@ -175,6 +188,57 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoSupplyCollateralCallback, IMo
 
         emit LeverageUpdated(_targetLeverageBps);
         emit MinHealthFactorUpdated(_minHealthFactor);
+    }
+
+    /* PROXY INITIALIZATION */
+
+    /// @notice Initialize a proxy instance for a specific user
+    /// @dev Called by MorphoStrategyFactory when deploying a new user proxy
+    ///      This function can only be called ONCE per proxy instance
+    ///      The implementation contract's immutables are shared across all proxies
+    /// @param _owner The user who owns this strategy proxy
+    /// @param _targetLeverageBps Target leverage ratio in basis points (e.g., 50000 = 5x)
+    /// @param _minHealthFactor Minimum health factor to maintain (in WAD)
+    function initialize(
+        address _owner,
+        uint256 _targetLeverageBps,
+        uint256 _minHealthFactor
+    ) external {
+        // Prevent re-initialization (critical for security)
+        if (_initialized) revert AlreadyInitialized();
+
+        // Validate parameters
+        if (_owner == address(0)) revert InvalidOwner();
+        if (_targetLeverageBps < BASIS_POINTS || _targetLeverageBps > 30000) {
+            revert InvalidLeverage();
+        }
+        if (_minHealthFactor < WAD) {
+            revert InvalidLeverage();
+        }
+
+        // Set initialization flag first (reentrancy protection)
+        _initialized = true;
+
+        // Set owner
+        owner = _owner;
+
+        // Set leverage parameters
+        targetLeverageBps = _targetLeverageBps;
+        minHealthFactor = _minHealthFactor;
+
+        // Approve tokens for Morpho operations
+        // Each proxy needs its own approvals
+        WSTETH.approve(address(MORPHO), type(uint256).max);
+        LOAN_TOKEN.approve(address(MORPHO), type(uint256).max);
+
+        emit LeverageUpdated(_targetLeverageBps);
+        emit MinHealthFactorUpdated(_minHealthFactor);
+    }
+
+    /// @notice Check if this proxy has been initialized
+    /// @return True if initialized, false otherwise
+    function initialized() external view returns (bool) {
+        return _initialized;
     }
 
     /* EXTERNAL FUNCTIONS - IStrategy Implementation */
