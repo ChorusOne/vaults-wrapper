@@ -3,7 +3,7 @@ pragma solidity 0.8.25;
 
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {IMorpho, IMorphoBase, MarketParams, Id, Position, Market} from "./interfaces/IMorpho.sol";
-import {IMorphoFlashLoanCallback} from "./interfaces/IMorphoCallbacks.sol";
+import {IMorphoSupplyCollateralCallback} from "./interfaces/IMorphoCallbacks.sol";
 import {IWstETH} from "./interfaces/IWstETH.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Wrapper} from "./Wrapper.sol";
@@ -11,21 +11,21 @@ import {IVaultHub} from "./interfaces/IVaultHub.sol";
 import {IDashboard} from "./interfaces/IDashboard.sol";
 
 /// @title MorphoLoopedStrategy
-/// @notice Leveraged staking strategy using Morpho Blue flash loans
-/// @dev Implements IStrategy and IMorphoFlashLoanCallback for atomic leverage operations
+/// @notice Leveraged staking strategy using Morpho Blue supply collateral callbacks
+/// @dev Implements IStrategy and IMorphoSupplyCollateralCallback for atomic leverage operations
 ///
 /// TODO PRODUCTION: Critical items before mainnet deployment
 /// 1. ACCESS CONTROL: Add OpenZeppelin Ownable/AccessControl to admin functions
-/// 2. DEX INTEGRATION: Implement stETH<->WETH swapping for exit flow (Curve, Uniswap)
+/// 2. EXIT FLOW: Implement exit using IMorphoRepayCallback for atomic unwinding
 /// 3. ORACLE INTEGRATION: Use Morpho's oracle for accurate price feeds in health checks
-/// 4. SLIPPAGE PROTECTION: Add min/max amount checks on all swaps and conversions
+/// 4. SLIPPAGE PROTECTION: Add min/max amount checks on wstETH minting
 /// 5. REENTRANCY GUARDS: Add ReentrancyGuard to all external functions
 /// 6. PAUSE MECHANISM: Add circuit breaker for emergency situations
 /// 7. COMPREHENSIVE TESTING: Unit tests, integration tests, fuzzing, formal verification
 /// 8. GAS OPTIMIZATION: Optimize storage layout and function calls
 /// 9. LIQUIDATION PROTECTION: Add monitoring and keeper system for position health
 /// 10. AUDIT: Complete security audit by reputable firm
-contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
+contract MorphoLoopedStrategy is IStrategy, IMorphoSupplyCollateralCallback {
     /* CONSTANTS */
     uint256 private constant WAD = 1e18;
     uint256 private constant ORACLE_PRICE_SCALE = 1e36;
@@ -57,7 +57,7 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
     /// @notice User positions mapping
     mapping(address => UserPosition) public userPositions;
 
-    /// @notice Callback context for flash loans
+    /// @notice Callback context for supply collateral callbacks
     CallbackContext private _callbackContext;
 
     /* STRUCTS */
@@ -77,6 +77,7 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
     struct CallbackContext {
         address user;
         uint256 stvTokenShares;
+        uint256 borrowAmount; // Amount to borrow in callback
         bool isDeposit; // true for deposit, false for exit
     }
 
@@ -157,7 +158,6 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
         minHealthFactor = _minHealthFactor;
 
         // Approve tokens for Morpho operations
-        STETH.approve(_wstETH, type(uint256).max);
         WSTETH.approve(_morpho, type(uint256).max);
         LOAN_TOKEN.approve(_morpho, type(uint256).max);
 
@@ -180,7 +180,7 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
 
     /* EXTERNAL FUNCTIONS - IStrategy Implementation */
 
-    /// @notice Execute leveraged staking strategy using flash loans
+    /// @notice Execute leveraged staking strategy using supply collateral callback
     /// @param user The user address
     /// @param stvTokenShares Amount of stv token shares to leverage
     function execute(address user, uint256 stvTokenShares) external override {
@@ -197,22 +197,51 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
         // Transfer stv tokens from caller (Escrow)
         STV_TOKEN.transferFrom(msg.sender, address(this), stvTokenShares);
 
-        // Calculate flash loan amount needed for target leverage
-        // For 2x leverage: we need to borrow roughly equal to initial collateral value
-        uint256 flashLoanAmount = _calculateFlashLoanAmount(stvTokenShares);
+        // Calculate total collateral needed and initial/borrow split for target leverage
+        // For 5x leverage: initialCollateral = 1/5 total, borrowAmount = 4/5 total
+        uint256 totalCollateralValue = _getCollateralValueFromStvShares(
+            stvTokenShares
+        );
+        uint256 leverageMultiplier = targetLeverageBps / BASIS_POINTS; // e.g., 5 for 50000 bps
+        uint256 initialCollateralValue = totalCollateralValue /
+            leverageMultiplier;
+        uint256 borrowAmount = totalCollateralValue - initialCollateralValue;
 
-        // TODO PRODUCTION: Add flash loan amount validation
-        // require(flashLoanAmount > 0 && flashLoanAmount < maxFlashLoanAmount, "Invalid flash loan");
+        // TODO PRODUCTION: Validate borrow amount is within safe limits
+        // require(borrowAmount > 0 && borrowAmount < maxBorrowAmount, "Invalid borrow amount");
+
+        // Mint INITIAL wstETH directly from Lido v3 Dashboard (no wrapping needed!)
+        uint256 initialWstETH = IDashboard(
+            payable(address(WRAPPER.DASHBOARD()))
+        ).mintWstETH{value: initialCollateralValue}(
+            address(this),
+            initialCollateralValue
+        );
+
+        emit DebugLog(
+            "Initial wstETH minted",
+            initialWstETH,
+            initialCollateralValue
+        );
 
         // Set callback context
         _callbackContext = CallbackContext({
             user: user,
             stvTokenShares: stvTokenShares,
+            borrowAmount: borrowAmount,
             isDeposit: true
         });
 
-        // Execute flash loan - callback will handle the leverage logic
-        MORPHO.flashLoan(address(LOAN_TOKEN), flashLoanAmount, "");
+        // Supply initial collateral WITH callback
+        // Morpho will record this collateral, THEN call onMorphoSupplyCollateral
+        // where we borrow against it and add more collateral
+        bytes memory data = abi.encode(user, borrowAmount);
+        MORPHO.supplyCollateral(
+            MARKET_PARAMS,
+            initialWstETH,
+            address(this),
+            data
+        );
 
         // Clear callback context
         delete _callbackContext;
@@ -224,7 +253,7 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
 
         UserPosition memory position = userPositions[user];
         uint256 actualLeverage = (position.collateralAmount * BASIS_POINTS) /
-            _getCollateralValueFromStvShares(stvTokenShares);
+            initialWstETH;
 
         emit StrategyExecuted(
             user,
@@ -259,38 +288,33 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
         uint256 debtToRepay = position.borrowedAmount;
         uint256 collateralToWithdraw = position.collateralAmount;
 
-        // TODO PRODUCTION: Check if position can be safely exited
-        // - Verify no pending liquidation
-        // - Check withdrawal queue availability
-        // - Validate minimum output amounts
+        // TODO PRODUCTION: Implement exit flow using Morpho repay callback
+        // Flow should be:
+        // 1. Call MORPHO.repay() with callback
+        // 2. In onMorphoRepay callback:
+        //    - Withdraw collateral (debt already reduced)
+        //    - Unwrap wstETH to get ETH
+        //    - Swap ETH to WETH if needed
+        //    - Approve WETH for Morpho to pull for repayment
+        // 3. Position unwound atomically
 
-        // Set callback context for exit
-        _callbackContext = CallbackContext({
-            user: user,
-            stvTokenShares: position.initialStvShares,
-            isDeposit: false
-        });
+        // For now, revert until exit flow is implemented
+        revert("Exit flow not implemented yet");
 
-        // Flash loan to repay debt and unwind position
-        MORPHO.flashLoan(address(LOAN_TOKEN), debtToRepay, "");
+        // emit PositionClosed(user, collateralToWithdraw, debtToRepay);
 
-        // Clear callback context
-        delete _callbackContext;
+        // // TODO PRODUCTION: Calculate actual return value considering:
+        // // - Accrued staking rewards
+        // // - Interest paid
+        // // - Fees
+        // // - Price impact from unwinding
+        // // Return initial shares (simplified - in production, calculate actual value)
+        // assets = position.initialStvShares;
 
-        emit PositionClosed(user, collateralToWithdraw, debtToRepay);
+        // // Clean up position
+        // delete userPositions[user];
 
-        // TODO PRODUCTION: Calculate actual return value considering:
-        // - Accrued staking rewards
-        // - Interest paid
-        // - Fees
-        // - Price impact from unwinding
-        // Return initial shares (simplified - in production, calculate actual value)
-        assets = position.initialStvShares;
-
-        // Clean up position
-        delete userPositions[user];
-
-        return assets;
+        // return assets;
     }
 
     /// @notice Get borrow details for a user
@@ -325,10 +349,10 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
 
     /* MORPHO CALLBACK */
 
-    /// @notice Callback function for Morpho flash loans
-    /// @param assets Amount of assets flash loaned
-    /// @param data Additional data (unused)
-    function onMorphoFlashLoan(
+    /// @notice Callback function for Morpho supply collateral
+    /// @param assets Amount of collateral being supplied
+    /// @param data Encoded callback data
+    function onMorphoSupplyCollateral(
         uint256 assets,
         bytes calldata data
     ) external override {
@@ -338,16 +362,57 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
         // TODO PRODUCTION: Verify callback context is valid
         // require(_callbackContext.user != address(0), "Invalid callback context");
 
-        CallbackContext memory ctx = _callbackContext;
+        (address user, uint256 borrowAmount) = abi.decode(data, (address, uint256));
 
-        if (ctx.isDeposit) {
-            _handleDepositCallback(ctx.user, ctx.stvTokenShares, assets);
-        } else {
-            _handleExitCallback(ctx.user, assets);
-        }
+        // At this point: Morpho has ALREADY recorded our initial collateral (assets)
+        // We can now borrow the FULL amount for our target leverage!
+
+        // Step 1: Borrow FULL WETH amount from Morpho
+        (uint256 borrowed, ) = MORPHO.borrow(
+            MARKET_PARAMS,
+            borrowAmount,
+            0, // use assets not shares
+            address(this),
+            address(this)
+        );
+
+        emit DebugLog("Borrowed from Morpho", borrowed, borrowAmount);
+
+        // Step 2: Unwrap WETH → ETH
+        IWETH(address(LOAN_TOKEN)).withdraw(borrowed);
+
+        emit DebugLog("WETH unwrapped to ETH", borrowed, 0);
+
+        // Step 3: Mint wstETH DIRECTLY from Lido v3 (no wrapping needed!)
+        uint256 additionalWstETH = IDashboard(payable(address(WRAPPER.DASHBOARD()))).mintWstETH{value: borrowed}(
+            address(this),
+            borrowed // amount of wstETH to mint
+        );
+
+        emit DebugLog("Additional wstETH minted", additionalWstETH, borrowed);
+
+        // Step 4: Approve Morpho to pull this additional wstETH as collateral
+        // When this callback completes, Morpho will transfer the approved wstETH
+        WSTETH.approve(address(MORPHO), additionalWstETH);
+
+        // Step 5: Record the position
+        userPositions[user] = UserPosition({
+            user: user,
+            collateralAmount: assets + additionalWstETH, // total collateral
+            borrowedAmount: borrowed,
+            initialStvShares: _callbackContext.stvTokenShares,
+            isExiting: false,
+            timestamp: block.timestamp
+        });
 
         // TODO PRODUCTION: Verify all tokens were properly transferred
         // TODO PRODUCTION: Emit detailed callback execution event
+    }
+
+    /// @notice Interface for WETH unwrapping
+    interface IWETH {
+        function withdraw(uint256 amount) external;
+        function deposit() external payable;
     }
 
     /* INTERNAL FUNCTIONS */
@@ -372,246 +437,9 @@ contract MorphoLoopedStrategy is IStrategy, IMorphoFlashLoanCallback {
             );
     }
 
-    /// @notice Handle flash loan callback for deposit (leveraging up)
-    /// @param user User address
-    /// @param stvTokenShares Initial stv token shares
-    /// @param flashLoanAmount Flash loan amount received
-    function _handleDepositCallback(
-        address user,
-        uint256 stvTokenShares,
-        uint256 flashLoanAmount
-    ) internal {
-        // TODO PRODUCTION: Add try-catch blocks for each step with proper error handling
-        // TODO PRODUCTION: Track gas usage and optimize
 
-        // Step 1: Mint stETH from stv shares
-        uint256 stETHAmount = _mintStETHFromStvShares(stvTokenShares);
 
-        // TODO PRODUCTION: Validate stETH amount is reasonable
-        // require(stETHAmount >= minExpectedStETH, "Insufficient stETH minted");
 
-        emit DebugLog("stETH minted", stETHAmount, 0);
-
-        // Step 2: Wrap stETH to wstETH (Morpho requires non-rebasing collateral)
-        uint256 wstETHAmount = WSTETH.wrap(stETHAmount);
-
-        // TODO PRODUCTION: Add slippage check on wrapping
-        // uint256 expectedWstETH = WSTETH.getWstETHByStETH(stETHAmount);
-        // require(wstETHAmount >= expectedWstETH * (BASIS_POINTS - MAX_SLIPPAGE_BPS) / BASIS_POINTS, SlippageExceeded());
-
-        emit DebugLog("wstETH wrapped", wstETHAmount, 0);
-
-        // Step 3: Supply wstETH as collateral to Morpho
-        MORPHO.supplyCollateral(MARKET_PARAMS, wstETHAmount, address(this), "");
-
-        // TODO PRODUCTION: Verify collateral was successfully supplied
-        // Position memory pos = MORPHO.position(MARKET_ID, address(this));
-        // require(pos.collateral >= wstETHAmount, "Collateral supply failed");
-
-        emit DebugLog("Collateral supplied", wstETHAmount, 0);
-
-        // Step 4: Borrow loan tokens against the collateral
-        // Borrow the flash loan amount so we can repay it
-        (uint256 assetsBorrowed, ) = MORPHO.borrow(
-            MARKET_PARAMS,
-            flashLoanAmount,
-            0, // shares (0 means use assets)
-            address(this),
-            address(this)
-        );
-
-        // TODO PRODUCTION: Validate borrowed amount matches expected
-        // require(assetsBorrowed >= flashLoanAmount, "Insufficient borrow");
-
-        emit DebugLog("Borrowed from Morpho", assetsBorrowed, 0);
-
-        // Step 5: Repay flash loan (assets already transferred to this contract)
-        // The flash loan will be automatically repaid when this callback completes
-        // TODO PRODUCTION: Verify contract has enough balance to repay
-        // require(LOAN_TOKEN.balanceOf(address(this)) >= flashLoanAmount, "Insufficient balance for repayment");
-
-        // Step 6: Record user position
-        userPositions[user] = UserPosition({
-            user: user,
-            collateralAmount: wstETHAmount,
-            borrowedAmount: assetsBorrowed,
-            initialStvShares: stvTokenShares,
-            isExiting: false,
-            timestamp: block.timestamp
-        });
-
-        // TODO PRODUCTION: Emit detailed position opened event with all parameters
-    }
-
-    /// @notice Handle flash loan callback for exit (deleveraging)
-    /// @param user User address
-    /// @param flashLoanAmount Flash loan amount for repaying debt
-    function _handleExitCallback(
-        address user,
-        uint256 flashLoanAmount
-    ) internal {
-        UserPosition storage position = userPositions[user];
-
-        // TODO PRODUCTION: Add comprehensive checks before unwinding
-        // TODO PRODUCTION: Add try-catch for each step with fallback logic
-
-        // Step 1: Repay Morpho debt
-        MORPHO.repay(
-            MARKET_PARAMS,
-            flashLoanAmount,
-            0, // shares (0 means use assets)
-            address(this),
-            ""
-        );
-
-        // TODO PRODUCTION: Verify debt was fully repaid
-        // Position memory pos = MORPHO.position(MARKET_ID, address(this));
-        // require(pos.borrowShares == 0 || pos.borrowShares < minDust, "Debt repayment incomplete");
-
-        // Step 2: Withdraw wstETH collateral
-        MORPHO.withdrawCollateral(
-            MARKET_PARAMS,
-            position.collateralAmount,
-            address(this),
-            address(this)
-        );
-
-        // TODO PRODUCTION: Verify collateral was withdrawn
-        // require(WSTETH.balanceOf(address(this)) >= position.collateralAmount, "Collateral withdrawal failed");
-
-        // Step 3: Unwrap wstETH to stETH
-        uint256 stETHAmount = WSTETH.unwrap(position.collateralAmount);
-
-        // TODO PRODUCTION: Add slippage check on unwrapping
-        // uint256 expectedStETH = WSTETH.getStETHByWstETH(position.collateralAmount);
-        // require(stETHAmount >= expectedStETH * (BASIS_POINTS - MAX_SLIPPAGE_BPS) / BASIS_POINTS, SlippageExceeded());
-
-        // TODO PRODUCTION CRITICAL: Implement DEX swap for stETH -> WETH/loan token
-        // Step 4: Swap stETH to loan token (WETH) to repay flash loan
-        // Example using Curve stETH/ETH pool:
-        // uint256 minOut = _calculateMinOutput(stETHAmount);
-        // uint256 wethReceived = ICurvePool(CURVE_STETH_POOL).exchange(
-        //     1, // stETH index
-        //     0, // ETH index
-        //     stETHAmount,
-        //     minOut
-        // );
-        // IWETH(LOAN_TOKEN).deposit{value: wethReceived}();
-        //
-        // Alternative: Use Uniswap V3 router
-        // ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
-        //     tokenIn: address(STETH),
-        //     tokenOut: address(LOAN_TOKEN),
-        //     fee: 500, // 0.05%
-        //     recipient: address(this),
-        //     deadline: block.timestamp,
-        //     amountIn: stETHAmount,
-        //     amountOutMinimum: minOut,
-        //     sqrtPriceLimitX96: 0
-        // });
-        // uint256 amountOut = swapRouter.exactInputSingle(params);
-
-        // TODO PRODUCTION: Verify we have enough to repay flash loan
-        // require(LOAN_TOKEN.balanceOf(address(this)) >= flashLoanAmount, "Insufficient funds for flash loan repayment");
-
-        // TODO PRODUCTION: Calculate and return any excess to user
-        // uint256 excess = LOAN_TOKEN.balanceOf(address(this)) - flashLoanAmount;
-        // if (excess > 0) {
-        //     LOAN_TOKEN.transfer(user, excess);
-        // }
-
-        // Flash loan will be automatically repaid when callback completes
-    }
-
-    /// @notice Mint stETH from stv token shares via Escrow
-    /// @param stvShares Amount of stv shares
-    /// @return stETHAmount Amount of stETH minted
-    function _mintStETHFromStvShares(
-        uint256 stvShares
-    ) internal returns (uint256 stETHAmount) {
-        // TODO PRODUCTION: Review this minting logic with Lido team
-        // TODO PRODUCTION: Verify this is the correct way to mint from STV shares
-        // TODO PRODUCTION: Add checks for minting capacity limits
-
-        // Approve Escrow to spend stv tokens
-        address escrow = address(WRAPPER.ESCROW());
-        STV_TOKEN.approve(escrow, stvShares);
-
-        // Get stETH balance before
-        uint256 stETHBefore = STETH.balanceOf(address(this));
-
-        // Mint stETH through the Wrapper's Dashboard
-        uint256 remainingCapacity = IDashboard(
-            payable(address(WRAPPER.DASHBOARD()))
-        ).remainingMintingCapacityShares(0);
-
-        // TODO PRODUCTION: Validate remaining capacity
-        // require(remainingCapacity >= expectedMintAmount, "Insufficient minting capacity");
-
-        // TODO PRODUCTION: Use actual conversion rate instead of full capacity
-        // uint256 sharesToMint = _convertStvSharesToStethShares(stvShares);
-        // require(sharesToMint <= remainingCapacity, "Exceeds minting capacity");
-
-        // Mint stETH shares
-        IDashboard(payable(address(WRAPPER.DASHBOARD()))).mintShares(
-            address(this),
-            remainingCapacity
-        );
-
-        // Get stETH balance after
-        uint256 stETHAfter = STETH.balanceOf(address(this));
-        stETHAmount = stETHAfter - stETHBefore;
-
-        require(stETHAmount > 0, "No stETH minted");
-
-        // TODO PRODUCTION: Add maximum deviation check
-        // uint256 expectedAmount = _getExpectedStETHFromStvShares(stvShares);
-        // require(
-        //     stETHAmount >= expectedAmount * (BASIS_POINTS - MAX_SLIPPAGE_BPS) / BASIS_POINTS &&
-        //     stETHAmount <= expectedAmount * (BASIS_POINTS + MAX_SLIPPAGE_BPS) / BASIS_POINTS,
-        //     "Mint amount out of bounds"
-        // );
-
-        return stETHAmount;
-    }
-
-    /// @notice Calculate flash loan amount needed for target leverage
-    /// @param stvTokenShares Initial stv token shares
-    /// @return Flash loan amount needed
-    function _calculateFlashLoanAmount(
-        uint256 stvTokenShares
-    ) internal view returns (uint256) {
-        // TODO PRODUCTION: Use accurate price feeds from Chainlink/Morpho oracle
-        // TODO PRODUCTION: Account for price impact of large positions
-        // TODO PRODUCTION: Add safety margin to prevent liquidation immediately after opening
-
-        // Estimate collateral value from stv shares
-        uint256 estimatedCollateralValue = _getCollateralValueFromStvShares(
-            stvTokenShares
-        );
-
-        // For target leverage of 2x, we need to borrow ~50% of collateral value
-        // leverage = totalCollateral / initialCollateral
-        // For 2x: we double the collateral, so borrow = initialCollateral
-        // Formula: borrowAmount = initialValue * (leverageRatio - 1)
-
-        uint256 borrowMultiplier = targetLeverageBps - BASIS_POINTS; // e.g., 20000 - 10000 = 10000
-        uint256 flashLoanAmount = (estimatedCollateralValue *
-            borrowMultiplier) / BASIS_POINTS;
-
-        // TODO PRODUCTION: Apply safety factor to prevent immediate liquidation
-        // Account for:
-        // - Oracle price deviation
-        // - Market volatility buffer
-        // - Gas costs for potential liquidation
-        // uint256 safetyFactor = 9500; // 95% to leave 5% buffer
-        // flashLoanAmount = (flashLoanAmount * safetyFactor) / BASIS_POINTS;
-
-        // TODO PRODUCTION: Validate against market liquidity
-        // require(flashLoanAmount <= getMaxBorrowFromMarket(), "Exceeds market liquidity");
-
-        return flashLoanAmount;
-    }
 
     /// @notice Estimate collateral value from stv shares
     /// @param stvShares Amount of stv shares
