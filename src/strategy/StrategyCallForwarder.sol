@@ -5,13 +5,18 @@ import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Own
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
+import {
+    IMorphoSupplyCallback,
+    IMorphoSupplyCollateralCallback
+} from "lib/morpho-blue/src/interfaces/IMorphoCallbacks.sol";
 import {IStrategyCallForwarder} from "src/interfaces/IStrategyCallForwarder.sol";
 
 contract StrategyCallForwarder is
     Initializable,
     ReentrancyGuardUpgradeable,
     OwnableUpgradeable,
-    IStrategyCallForwarder
+    IStrategyCallForwarder,
+    IMorphoSupplyCollateralCallback
 {
     constructor() {
         _disableInitializers();
@@ -59,5 +64,16 @@ contract StrategyCallForwarder is
      */
     function sendValue(address payable _recipient, uint256 _amount) external onlyOwner nonReentrant {
         Address.sendValue(_recipient, _amount);
+    }
+
+    function onMorphoSupplyCollateral(uint256 amount, bytes calldata data) external {
+        // TODO: Add some form of checking.
+        // if (msg.sender != address(MORPHO)) revert UnauthorizedCallback();
+
+        // Forward the callback to the owner (strategy)
+        bytes memory callData = abi.encodeCall(IMorphoSupplyCollateralCallback.onMorphoSupplyCollateral, (amount, data));
+
+        // Forward the callback to the owner (strategy)
+        Address.functionCall(owner(), callData);
     }
 }

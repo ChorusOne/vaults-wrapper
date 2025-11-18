@@ -227,12 +227,8 @@ interface IMorphoBase {
     /// @param assets The amount of collateral to supply.
     /// @param onBehalf The address that will own the increased collateral position.
     /// @param data Arbitrary data to pass to the `onMorphoSupplyCollateral` callback. Pass empty data if not needed.
-    function supplyCollateral(
-        MarketParams memory marketParams,
-        uint256 assets,
-        address onBehalf,
-        bytes memory data
-    ) external;
+    function supplyCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, bytes memory data)
+        external;
 
     /// @notice Withdraws `assets` of collateral on behalf of `onBehalf` and sends the assets to `receiver`.
     /// @dev `msg.sender` must be authorized to manage `onBehalf`'s positions.
@@ -241,12 +237,8 @@ interface IMorphoBase {
     /// @param assets The amount of collateral to withdraw.
     /// @param onBehalf The address of the owner of the collateral position.
     /// @param receiver The address that will receive the collateral assets.
-    function withdrawCollateral(
-        MarketParams memory marketParams,
-        uint256 assets,
-        address onBehalf,
-        address receiver
-    ) external;
+    function withdrawCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, address receiver)
+        external;
 
     /// @notice Liquidates the given `repaidShares` of debt asset or seize the given `seizedAssets` of collateral on the
     /// given market `marketParams` of the given `borrower`'s position, optionally calling back the caller's
@@ -308,19 +300,17 @@ interface IMorphoStaticTyping is IMorphoBase {
     /// @notice The state of the position of `user` on the market corresponding to `id`.
     /// @dev Warning: For `feeRecipient`, `supplyShares` does not contain the accrued shares since the last interest
     /// accrual.
-    function position(
-        Id id,
-        address user
-    ) external view returns (uint256 supplyShares, uint128 borrowShares, uint128 collateral);
+    function position(Id id, address user)
+        external
+        view
+        returns (uint256 supplyShares, uint128 borrowShares, uint128 collateral);
 
     /// @notice The state of the market corresponding to `id`.
     /// @dev Warning: `totalSupplyAssets` does not contain the accrued interest since the last interest accrual.
     /// @dev Warning: `totalBorrowAssets` does not contain the accrued interest since the last interest accrual.
     /// @dev Warning: `totalSupplyShares` does not contain the accrued shares by `feeRecipient` since the last interest
     /// accrual.
-    function market(
-        Id id
-    )
+    function market(Id id)
         external
         view
         returns (
@@ -335,9 +325,10 @@ interface IMorphoStaticTyping is IMorphoBase {
     /// @notice The market params corresponding to `id`.
     /// @dev This mapping is not used in Morpho. It is there to enable reducing the cost associated to calldata on layer
     /// 2s by creating a wrapper contract with functions that take `id` as input instead of `marketParams`.
-    function idToMarketParams(
-        Id id
-    ) external view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv);
+    function idToMarketParams(Id id)
+        external
+        view
+        returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv);
 }
 
 /// @title IMorpho

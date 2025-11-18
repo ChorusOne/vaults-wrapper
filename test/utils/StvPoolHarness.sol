@@ -48,7 +48,8 @@ contract StvPoolHarness is Test {
     // Deployment configuration struct
     enum StrategyKind {
         NONE,
-        GGV
+        GGV,
+        MORPHO_LOOP
     }
 
     struct DeploymentConfig {
@@ -64,6 +65,8 @@ contract StvPoolHarness is Test {
         StrategyKind strategyKind;
         address ggvTeller;
         address ggvBoringQueue;
+        address morpho;
+        address morphoWeth;
         uint256 timelockMinDelaySeconds;
         address timelockExecutor;
         string name;
@@ -119,7 +122,9 @@ contract StvPoolHarness is Test {
         });
 
         Factory.CommonPoolConfig memory commonPoolConfig = Factory.CommonPoolConfig({
-            minWithdrawalDelayTime: config.minWithdrawalDelayTime, name: config.name, symbol: config.symbol
+            minWithdrawalDelayTime: config.minWithdrawalDelayTime,
+            name: config.name,
+            symbol: config.symbol
         });
 
         Factory.AuxiliaryPoolConfig memory auxiliaryConfig = Factory.AuxiliaryPoolConfig({
@@ -137,15 +142,30 @@ contract StvPoolHarness is Test {
         address strategyFactoryAddress = address(0);
         if (config.strategyKind == StrategyKind.GGV) {
             strategyFactoryAddress = address(factory.GGV_STRATEGY_FACTORY());
+        } else if (config.strategyKind == StrategyKind.MORPHO_LOOP) {
+            // For Morpho tests, the strategy will be deployed directly in the test
+            // using the MorphoMock. Factory deployment can be added later.
+            strategyFactoryAddress = address(0);
         }
         // StrategyKind.NONE: strategyFactoryAddress remains address(0)
 
         vm.startPrank(config.nodeOperator);
         Factory.PoolIntermediate memory intermediate = factory.createPoolStart{value: CONNECT_DEPOSIT}(
-            vaultConfig, commonPoolConfig, auxiliaryConfig, timelockConfig, strategyFactoryAddress, ""
+            vaultConfig,
+            commonPoolConfig,
+            auxiliaryConfig,
+            timelockConfig,
+            strategyFactoryAddress,
+            ""
         );
         Factory.PoolDeployment memory deployment = factory.createPoolFinish(
-            vaultConfig, commonPoolConfig, auxiliaryConfig, timelockConfig, strategyFactoryAddress, "", intermediate
+            vaultConfig,
+            commonPoolConfig,
+            auxiliaryConfig,
+            timelockConfig,
+            strategyFactoryAddress,
+            "",
+            intermediate
         );
         vm.stopPrank();
 
@@ -161,21 +181,22 @@ contract StvPoolHarness is Test {
         // Apply initial vault report with current total value equal to connect deposit
         core.applyVaultReport(vault_, CONNECT_DEPOSIT, 0, 0, 0);
 
-        return WrapperContext({
-            pool: pool,
-            withdrawalQueue: withdrawalQueue,
-            dashboard: dashboard,
-            vault: IStakingVault(vault_),
-            strategy: strategy_,
-            distributor: distributor,
-            timelock: timelock
-        });
+        return
+            WrapperContext({
+                pool: pool,
+                withdrawalQueue: withdrawalQueue,
+                dashboard: dashboard,
+                vault: IStakingVault(vault_),
+                strategy: strategy_,
+                distributor: distributor,
+                timelock: timelock
+            });
     }
 
-    function _deployStvPool(bool enableAllowlist, uint256 nodeOperatorFeeBP)
-        internal
-        returns (WrapperContext memory context)
-    {
+    function _deployStvPool(
+        bool enableAllowlist,
+        uint256 nodeOperatorFeeBP
+    ) internal returns (WrapperContext memory context) {
         DeploymentConfig memory config = DeploymentConfig({
             allowlistEnabled: enableAllowlist,
             mintingEnabled: false,
@@ -189,6 +210,8 @@ contract StvPoolHarness is Test {
             strategyKind: StrategyKind.NONE,
             ggvTeller: address(0),
             ggvBoringQueue: address(0),
+            morpho: address(0),
+            morphoWeth: address(0),
             timelockMinDelaySeconds: 0,
             timelockExecutor: NODE_OPERATOR,
             name: "Test STV Pool",
@@ -239,7 +262,7 @@ contract StvPoolHarness is Test {
      */
     function reportVaultValueChangeNoFees(WrapperContext memory ctx, uint256 _factorBp) public {
         uint256 totalValue = ctx.dashboard.totalValue();
-        totalValue = totalValue * _factorBp / 10000;
+        totalValue = (totalValue * _factorBp) / 10000;
         core.applyVaultReport(address(ctx.vault), totalValue, 0, 0, 0);
 
         assertEq(totalValue, ctx.dashboard.totalValue(), "Total value should match reported one, check quarantine");
@@ -313,12 +336,14 @@ contract StvPoolHarness is Test {
                 totalPreviewRedeem += _ctx.pool.previewRedeem(_ctx.pool.balanceOf(holders[i]));
             }
             uint256 totalAssets = _ctx.pool.totalAssets();
-            uint256 diff =
-                totalPreviewRedeem > totalAssets ? totalPreviewRedeem - totalAssets : totalAssets - totalPreviewRedeem;
+            uint256 diff = totalPreviewRedeem > totalAssets
+                ? totalPreviewRedeem - totalAssets
+                : totalAssets - totalPreviewRedeem;
             assertTrue(
                 diff <= 1,
                 _contextMsg(
-                    _context, "Sum of previewRedeem of all holders should equal totalAssets (within 1 wei accuracy)"
+                    _context,
+                    "Sum of previewRedeem of all holders should equal totalAssets (within 1 wei accuracy)"
                 )
             );
         }

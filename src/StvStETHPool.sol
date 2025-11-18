@@ -5,6 +5,7 @@ import {StvPool} from "./StvPool.sol";
 import {IVaultHub} from "./interfaces/core/IVaultHub.sol";
 import {IWstETH} from "./interfaces/core/IWstETH.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {console} from "forge-std/console.sol";
 
 /**
  * @title StvStETHPool
@@ -783,6 +784,14 @@ contract StvStETHPool is StvPool {
         if (mintedStethShares == 0) return;
 
         uint256 stvToLock = calcStvToLockForStethShares(mintedStethShares);
+
+        console.log("[_update DEBUG] _from:", _from);
+        console.log("[_update DEBUG] _to:", _to);
+        console.log("[_update DEBUG] _value:", _value);
+        console.log("[_update DEBUG] mintedStethShares:", mintedStethShares);
+        console.log("[_update DEBUG] stvToLock (required):", stvToLock);
+        console.log("[_update DEBUG] balanceOf(_from):", balanceOf(_from));
+        console.log("[_update DEBUG] Sufficient?", balanceOf(_from) >= stvToLock);
 
         if (balanceOf(_from) < stvToLock) revert InsufficientReservedBalance();
     }

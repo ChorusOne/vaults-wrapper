@@ -32,6 +32,8 @@ contract StvStrategyPoolHarness is StvStETHPoolHarness {
             strategyKind: StrategyKind.GGV,
             ggvTeller: _teller,
             ggvBoringQueue: _boringQueue,
+            morpho: address(0),
+            morphoWeth: address(0),
             timelockMinDelaySeconds: 0,
             timelockExecutor: NODE_OPERATOR,
             name: "Integration Strategy Pool",
@@ -45,7 +47,9 @@ contract StvStrategyPoolHarness is StvStETHPoolHarness {
         return ctx;
     }
 
-    function _allPossibleStvHolders(WrapperContext memory ctx) internal view override returns (address[] memory) {
+    function _allPossibleStvHolders(
+        WrapperContext memory ctx
+    ) internal view virtual override returns (address[] memory) {
         address[] memory holders_ = super._allPossibleStvHolders(ctx);
         address[] memory holders = new address[](holders_.length + 2);
         uint256 i = 0;

@@ -35,3 +35,6 @@ docs/
 # MacOS
 .DS_Store
 artifacts/
+
+# Anvil log for integration tests
+anvil.log

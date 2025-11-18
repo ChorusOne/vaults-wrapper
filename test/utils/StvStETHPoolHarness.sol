@@ -9,10 +9,11 @@ import {StvPoolHarness} from "test/utils/StvPoolHarness.sol";
  * @notice Helper contract for integration tests that provides common setup for StvStETHPool (minting, no strategy)
  */
 contract StvStETHPoolHarness is StvPoolHarness {
-    function _deployStvStETHPool(bool enableAllowlist, uint256 nodeOperatorFeeBP, uint256 reserveRatioGapBP)
-        internal
-        returns (WrapperContext memory)
-    {
+    function _deployStvStETHPool(
+        bool enableAllowlist,
+        uint256 nodeOperatorFeeBP,
+        uint256 reserveRatioGapBP
+    ) internal returns (WrapperContext memory) {
         DeploymentConfig memory config = DeploymentConfig({
             allowlistEnabled: enableAllowlist,
             mintingEnabled: true,
@@ -26,6 +27,8 @@ contract StvStETHPoolHarness is StvPoolHarness {
             strategyKind: StrategyKind.NONE,
             ggvTeller: address(0),
             ggvBoringQueue: address(0),
+            morpho: address(0),
+            morphoWeth: address(0),
             timelockMinDelaySeconds: 0,
             timelockExecutor: NODE_OPERATOR,
             name: "Test stETH Pool",
@@ -81,6 +84,6 @@ contract StvStETHPoolHarness is StvPoolHarness {
      */
     function _calcMaxMintableStShares(WrapperContext memory ctx, uint256 _eth) public view returns (uint256) {
         uint256 wrapperRrBp = stvStETHPool(ctx).reserveRatioBP();
-        return steth.getSharesByPooledEth(_eth * (TOTAL_BASIS_POINTS - wrapperRrBp) / TOTAL_BASIS_POINTS);
+        return steth.getSharesByPooledEth((_eth * (TOTAL_BASIS_POINTS - wrapperRrBp)) / TOTAL_BASIS_POINTS);
     }
 }

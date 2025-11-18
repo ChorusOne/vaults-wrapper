@@ -8,7 +8,8 @@ fs_permissions = [
     { access = "read", path = "./" },
     { access = "read-write", path = "./deployments" }
 ]
-solc_version = "0.8.30"
+# Use 0.8.30 as default, but allow auto-detection for Morpho (0.8.19)
+auto_detect_solc = true
 via_ir = true # although it's slower it helps with stack too deep errors in tests
 dynamic_test_linking = true # to improve compilation speed
 
@@ -45,6 +46,14 @@ ignore = [
     "test/**",
     "script/**",
 ]
+
+[profile.test]
+# Inherits from default profile
+# Used by integration and unit tests in CI and locally
+
+[profile.ci]
+# Inherits from default profile
+# Used by lint and build checks in CI
 
 [lint]
 lint_on_build = false # TODO: enable later
