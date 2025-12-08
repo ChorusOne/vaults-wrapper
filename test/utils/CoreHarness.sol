@@ -37,11 +37,18 @@ interface IKernel {
 
 interface IACL {
     function grantPermission(address _entity, address _app, bytes32 _role) external;
+
     function revokePermission(address _entity, address _app, bytes32 _role) external;
 }
 
 interface IVaultHub is IVaultHubIntact {
     function mock__setReportIsAlwaysFresh(bool _reportIsAlwaysFresh) external;
+}
+
+interface IAccessControl {
+    function grantRole(bytes32 role, address account) external;
+
+    function hasRole(bytes32 role, address account) external view returns (bool);
 }
 
 contract CoreHarness is Test {
@@ -54,7 +61,7 @@ contract CoreHarness is Test {
     IOperatorGrid public operatorGrid;
     IHashConsensusView public hashConsensus;
 
-    uint256 public constant INITIAL_LIDO_SUBMISSION = 15_000 ether;
+    uint256 public constant INITIAL_LIDO_SUBMISSION = 150_000 ether;
     uint256 public constant CONNECT_DEPOSIT = 1 ether;
     uint256 public constant LIDO_TOTAL_BASIS_POINTS = 10000;
     uint256 public constant NODE_OPERATOR_FEE_RATE = 1_00; // 1% in basis points
@@ -106,9 +113,8 @@ contract CoreHarness is Test {
         vm.startPrank(agent);
         {
             try IHashConsensus(hashConsensusAddr).updateInitialEpoch(1) {
-            // ok
-            }
-                catch {
+                // ok
+            } catch {
                 // ignore if already set on pre-deployed core (Hoodi)
             }
 
@@ -125,8 +131,7 @@ contract CoreHarness is Test {
         // Ensure Lido has sufficient shares; on Hoodi it's already funded. Only top up if low.
         uint256 totalShares = steth.getTotalShares();
         if (totalShares < 100000) {
-            try steth.submit{value: INITIAL_LIDO_SUBMISSION}(address(this)) {}
-                catch {
+            try steth.submit{value: INITIAL_LIDO_SUBMISSION}(address(this)) {} catch {
                 // ignore stake limit or other constraints on pre-deployed core
             }
         }
@@ -136,8 +141,8 @@ contract CoreHarness is Test {
             IOperatorGrid.TierParams[] memory params = new IOperatorGrid.TierParams[](1);
             params[0] = IOperatorGrid.TierParams({
                 shareLimit: 10_000 ether,
-                reserveRatioBP: tier.reserveRatioBP,
-                forcedRebalanceThresholdBP: tier.forcedRebalanceThresholdBP,
+                reserveRatioBP: 10000,
+                forcedRebalanceThresholdBP: 9750,
                 infraFeeBP: tier.infraFeeBP,
                 liquidityFeeBP: tier.liquidityFeeBP,
                 reservationFeeBP: tier.reservationFeeBP
@@ -178,7 +183,7 @@ contract CoreHarness is Test {
         uint256 reportTimestamp = block.timestamp;
         uint256 refSlot;
         // Try to get the actual refSlot from HashConsensus, fallback to naive calculation
-        (refSlot,) = hashConsensus.getCurrentFrame();
+        (refSlot, ) = hashConsensus.getCurrentFrame();
 
         // TODO: is fallback needed?
         // try hashConsensus.getCurrentFrame() returns (uint256 refSlot_, uint256) {
@@ -232,7 +237,7 @@ contract CoreHarness is Test {
         transferredAmount = _stakingVault.balance;
         if (transferredAmount > 0) {
             vm.prank(_stakingVault);
-            (bool sent,) = BEACON_CHAIN.call{value: transferredAmount}("");
+            (bool sent, ) = BEACON_CHAIN.call{value: transferredAmount}("");
             require(sent, "ETH send to beacon chain failed");
         }
         return transferredAmount;
@@ -244,7 +249,7 @@ contract CoreHarness is Test {
      */
     function mockValidatorExitReturnETH(address _stakingVault, uint256 _ethAmount) external {
         vm.prank(BEACON_CHAIN);
-        (bool success,) = _stakingVault.call{value: _ethAmount}("");
+        (bool success, ) = _stakingVault.call{value: _ethAmount}("");
         require(success, "ETH return from beacon chain failed");
     }
 
@@ -280,7 +285,7 @@ contract CoreHarness is Test {
         uint256 newBufferedEther = currentBufferedEther + _amount;
 
         // [depositedValidators (128) | newBufferedEther (128)]
-        bytes32 newStorageWord = bytes32(depositedValidators << 128 | newBufferedEther);
+        bytes32 newStorageWord = bytes32((depositedValidators << 128) | newBufferedEther);
 
         vm.store(address(steth), BUFFERED_ETHER_SLOT, newStorageWord);
 
