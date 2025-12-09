@@ -18,6 +18,7 @@ import {IMorpho, Id, Market, MarketParams, Position} from "lib/morpho-blue/src/i
 import {IMorphoRepayCallback, IMorphoSupplyCallback} from "lib/morpho-blue/src/interfaces/IMorphoCallbacks.sol";
 import {IOracle} from "lib/morpho-blue/src/interfaces/IOracle.sol";
 import {IWETH} from "src/interfaces/erc20/IWETH.sol";
+import {IDexRouter} from "src/interfaces/IDexRouter.sol";
 
 import {console} from "forge-std/console.sol";
 
@@ -48,6 +49,9 @@ contract MorphoLoopStrategy is
     // Maximum leverage in basis points (e.g., 30000 = 3x)
     uint256 public immutable MAX_LEVERAGE_BP;
 
+    // DEX router for wstETH -> WETH swaps during withdrawal
+    IDexRouter public immutable DEX_ROUTER;
+
     // ACL
     bytes32 public constant SUPPLY_FEATURE = keccak256("SUPPLY_FEATURE");
     bytes32 public constant SUPPLY_PAUSE_ROLE = keccak256("SUPPLY_PAUSE_ROLE");
@@ -58,13 +62,20 @@ contract MorphoLoopStrategy is
     }
 
     struct LoopExitParams {
-        uint256 collateralToWithdraw; // Amount of wstETH collateral to withdraw
+        uint256 slippageBps; // DEX slippage tolerance (e.g., 100 = 1%)
     }
 
     // Morpho callbacks.
     enum MorphoCallback {
         Unused,
-        OnMorphoSupplyCollateral
+        OnMorphoSupplyCollateral,
+        OnMorphoRepay
+    }
+
+    // Data passed to onMorphoRepay callback
+    struct RepayCallbackData {
+        uint256 slippageBps;
+        address callForwarder;
     }
 
     // Temporary storage for callback context
@@ -100,12 +111,14 @@ contract MorphoLoopStrategy is
         address _pool,
         address _morpho,
         address _weth,
+        address _dexRouter,
         MarketParams memory _marketParams,
         uint256 _maxLeverageBp
     ) StrategyCallForwarderRegistry(_strategyId, _strategyCallForwarderImpl) {
         if (_pool == address(0)) revert ZeroArgument("_pool");
         if (_morpho == address(0)) revert ZeroArgument("_morpho");
         if (_weth == address(0)) revert ZeroArgument("_weth");
+        if (_dexRouter == address(0)) revert ZeroArgument("_dexRouter");
         if (_marketParams.loanToken != _weth) revert ZeroArgument("loan token must be WETH");
 
         POOL_ = StvStETHPool(payable(_pool));
@@ -113,6 +126,7 @@ contract MorphoLoopStrategy is
         STETH = IStETH(POOL_.STETH());
         MORPHO = IMorpho(_morpho);
         WETH = IWETH(_weth);
+        DEX_ROUTER = IDexRouter(_dexRouter);
 
         // Store market params as individual immutables
         MARKET_LOAN_TOKEN = _marketParams.loanToken;
@@ -445,40 +459,79 @@ contract MorphoLoopStrategy is
 
     /**
      * @notice Morpho callback executed during repay
-     * @dev This is the KEY callback for atomic leveraged looping
-     * @dev Morpho calls this AFTER sending borrowed WETH but BEFORE checking collateral
-     * @dev This allows us to:
-     *      1. Receive borrowed WETH
-     *      2. Convert WETH → ETH → stETH → wstETH
-     *      3. Supply wstETH as collateral
-     *      4. Return to Morpho with position now properly collateralized
+     * @dev Called BEFORE Morpho pulls the repayment amount
+     * @dev This allows us to atomically:
+     *      1. Withdraw all wstETH collateral from Morpho
+     *      2. Swap wstETH -> WETH via DEX
+     *      3. Approve WETH to Morpho for repayment
+     *      4. Return to Morpho which will pull the WETH
+     * @param repaidAssets The amount of WETH that needs to be repaid
+     * @param data Encoded RepayCallbackData containing slippage and forwarder info
      */
     function onMorphoRepay(uint256 repaidAssets, bytes calldata data) external {
+        console.log("=== onMorphoRepay callback ===");
+        console.log("Repaid assets (WETH needed):", repaidAssets);
+
+        // 1. Validate caller is Morpho
         if (msg.sender != address(MORPHO)) revert UnauthorizedCallback();
 
+        // 2. Validate callback context
         CallbackContext memory ctx = _callbackContext;
         if (ctx.callBackFrom == address(0)) revert NoActiveContext();
-        // if (ctx.isRepayCallback) return; // Only process during leverage, not deleverage
+        if (ctx.callbackType != MorphoCallback.OnMorphoRepay) revert InvalidMorphoCallback();
 
-        // At this point, we have received WETH from the borrow
-        uint256 wethBalance = WETH.balanceOf(address(this));
+        // 3. Decode callback data
+        RepayCallbackData memory cbData = abi.decode(data, (RepayCallbackData));
+        IStrategyCallForwarder callForwarder = IStrategyCallForwarder(cbData.callForwarder);
 
-        // 1. Unwrap WETH to ETH
-        WETH.withdraw(wethBalance);
+        // 4. Get current collateral amount and withdraw ALL from Morpho
+        Position memory pos = MORPHO.position(MARKET_ID, cbData.callForwarder);
+        uint256 collateralAmount = pos.collateral;
+        console.log("Collateral to withdraw:", collateralAmount);
 
-        // 2. Stake ETH with Lido to get stETH
-        uint256 stethReceived = STETH.submit{value: wethBalance}(address(0));
+        if (collateralAmount > 0) {
+            // Withdraw collateral to strategy contract (not callForwarder)
+            // Strategy is authorized to act on behalf of callForwarder
+            MORPHO.withdrawCollateral(
+                getMarketParams(),
+                collateralAmount,
+                cbData.callForwarder,
+                address(this) // Receive wstETH here for swapping
+            );
+            console.log("Withdrew collateral to strategy");
+        }
 
-        // 3. Approve and wrap stETH to wstETH
-        STETH.approve(address(WSTETH), stethReceived);
-        uint256 wstethReceived = WSTETH.wrap(stethReceived);
+        // 5. Calculate max wstETH to spend with slippage
+        // repaidAssets = exact WETH needed
+        uint256 maxWstethToSpend = (repaidAssets * (10000 + cbData.slippageBps)) / 10000;
+        console.log("Max wstETH to spend (with slippage):", maxWstethToSpend);
 
-        // 4. Supply the new wstETH as additional collateral to Morpho
-        // This happens on behalf of the user's call forwarder
-        WSTETH.approve(address(MORPHO), wstethReceived);
-        MORPHO.supplyCollateral(getMarketParams(), wstethReceived, ctx.callBackFrom, new bytes(0));
+        // 6. Approve wstETH to DEX router
+        WSTETH.approve(address(DEX_ROUTER), maxWstethToSpend);
 
-        // Position is now properly collateralized, the borrow will succeed when we return
+        // 7. Execute swap: wstETH -> exact WETH
+        uint256 wstethUsed = DEX_ROUTER.buy(
+            address(WSTETH),
+            address(WETH),
+            repaidAssets, // exact WETH needed
+            maxWstethToSpend // max wstETH to spend
+        );
+        console.log("wstETH used for swap:", wstethUsed);
+
+        // 8. Return unused wstETH to call forwarder
+        uint256 remainingWsteth = WSTETH.balanceOf(address(this));
+        console.log("Remaining wstETH after swap:", remainingWsteth);
+        if (remainingWsteth > 0) {
+            WSTETH.transfer(cbData.callForwarder, remainingWsteth);
+            console.log("Transferred remaining wstETH to callForwarder");
+        }
+
+        // 9. Approve WETH to Morpho for repayment
+        WETH.approve(address(MORPHO), repaidAssets);
+        console.log("Approved WETH to Morpho for repayment");
+
+        // Morpho will pull the WETH after this callback returns
+        console.log("=== onMorphoRepay callback complete ===");
     }
 
     // =================================================================================
@@ -487,107 +540,126 @@ contract MorphoLoopStrategy is
 
     /**
      * @inheritdoc IStrategy
+     * @notice Requests a full exit from the leveraged position
+     * @dev Uses Morpho's repay callback to atomically:
+     *      1. Repay all debt
+     *      2. Withdraw all collateral
+     *      3. Swap wstETH -> WETH for debt repayment
+     *      4. Unwrap remaining wstETH -> stETH
+     *      5. Request pool withdrawal
+     * @param _wsteth Ignored for full exit (always exits entire position)
+     * @param _params Encoded LoopExitParams with slippageBps
+     * @return requestId The withdrawal request ID
      */
-    function requestExitByWsteth(uint256 _wstethAmount, bytes calldata _params) external returns (bytes32 requestId) {
-        LoopExitParams memory params = abi.decode(_params, (LoopExitParams));
+    function requestExitByWsteth(uint256 _wsteth, bytes calldata _params) external returns (bytes32 requestId) {
+        console.log("=== requestExitByWsteth ===");
+
+        LoopExitParams memory exitParams = abi.decode(_params, (LoopExitParams));
         IStrategyCallForwarder callForwarder = _getOrCreateCallForwarder(msg.sender);
 
-        // Get current Morpho position
-        Position memory position = MORPHO.position(MARKET_ID, address(callForwarder));
-        uint256 currentCollateral = position.collateral;
-        uint256 borrowShares = position.borrowShares;
+        // 1. Get current Morpho position
+        Position memory pos = MORPHO.position(MARKET_ID, address(callForwarder));
+        console.log("Current collateral:", pos.collateral);
+        console.log("Current borrow shares:", pos.borrowShares);
 
-        // Determine how much collateral to withdraw
-        uint256 collateralToWithdraw = params.collateralToWithdraw > 0
-            ? Math.min(params.collateralToWithdraw, currentCollateral)
-            : Math.min(_wstethAmount, currentCollateral);
-
-        // Calculate proportional debt to repay to maintain health factor
-        // For full exit: repay all debt and withdraw all collateral
-        uint256 debtToRepay;
-        if (collateralToWithdraw == currentCollateral) {
-            // Full exit - repay all debt
-            debtToRepay = type(uint256).max; // Will repay all shares
+        if (pos.collateral == 0 && pos.borrowShares == 0) {
+            revert InsufficientCollateral();
         }
-        // else {
-        //     // Partial exit - calculate proportional repayment
-        //     // Need to maintain safe LTV after withdrawal
-        //     uint256 remainingCollateral = currentCollateral - collateralToWithdraw;
-        //     uint256 remainingCollateralValue = WSTETH.getStETHByWstETH(remainingCollateral);
-        //     uint256 maxSafeBorrow = (((remainingCollateralValue * MARKET_LLTV) / 1e18) * 9000) / 10000; // 90% of max
 
-        //     // Convert current borrow shares to assets
-        //     // TODO: Need to get actual borrow amount from Morpho market state
-        //     debtToRepay = 0; // Calculate based on market state
-        // }
+        // 2. Setup callback context
+        _callbackContext = CallbackContext({
+            callBackFrom: address(callForwarder),
+            borrowAmount: 0, // not used for repay
+            callbackType: MorphoCallback.OnMorphoRepay
+        });
 
-        // Request exit by stvETH from Withdrawal Queue
-        // callForwarder.doCall(
-        //     address(WITHDRAWAL),
-        //     abi.encodeCall(
-        //         MORPHO.withdrawCollateral,
-        //         (getMarketParams(), collateralAmount, address(callForwarder), address(callForwarder))
-        //     )
-        // );
+        // 3. Prepare callback data
+        RepayCallbackData memory cbData = RepayCallbackData({
+            slippageBps: exitParams.slippageBps,
+            callForwarder: address(callForwarder)
+        });
 
-        // Execute deleverage
-        _executeDeleverage(callForwarder, collateralToWithdraw, debtToRepay);
-
-        requestId = keccak256(abi.encodePacked(msg.sender, block.timestamp, _wstethAmount));
-
-        emit ExitRequested(msg.sender, requestId, collateralToWithdraw, debtToRepay);
-        emit StrategyExitRequested(msg.sender, requestId, _wstethAmount, _params);
-    }
-
-    function _executeDeleverage(
-        IStrategyCallForwarder callForwarder,
-        uint256 collateralAmount,
-        uint256 debtAmount
-    ) internal {
-        // 1. Withdraw wstETH collateral from Morpho
-        if (collateralAmount > 0) {
+        // 4. Execute repay with callback (repays ALL debt using shares)
+        // The callback will withdraw collateral, swap to WETH, and approve for repayment
+        if (pos.borrowShares > 0) {
+            console.log("Calling Morpho.repay with callback");
             callForwarder.doCall(
                 address(MORPHO),
                 abi.encodeCall(
-                    MORPHO.withdrawCollateral,
-                    (getMarketParams(), collateralAmount, address(callForwarder), address(callForwarder))
+                    MORPHO.repay,
+                    (
+                        getMarketParams(),
+                        0, // assets = 0 means use shares
+                        pos.borrowShares, // repay all borrow shares
+                        address(callForwarder),
+                        abi.encode(cbData)
+                    )
                 )
             );
         }
 
-        // 2. Convert wstETH to WETH for debt repayment
-        if (debtAmount > 0) {
-            // Unwrap wstETH → stETH
-            bytes memory unwrapResult = callForwarder.doCall(
+        // Clear callback context
+        delete _callbackContext;
+
+        // 5. After repay: unwrap remaining wstETH -> stETH
+        uint256 remainingWsteth = WSTETH.balanceOf(address(callForwarder));
+        console.log("Remaining wstETH after exit:", remainingWsteth);
+
+        if (remainingWsteth > 0) {
+            callForwarder.doCall(
                 address(WSTETH),
-                abi.encodeWithSelector(WSTETH.unwrap.selector, collateralAmount)
+                abi.encodeWithSelector(WSTETH.unwrap.selector, remainingWsteth)
             );
-            uint256 stethAmount = abi.decode(unwrapResult, (uint256));
-
-            // For immediate repayment, we need ETH
-            // Option 1: Use Curve to swap stETH → ETH (most liquid)
-            // Option 2: Request withdrawal from Lido (requires waiting)
-            // For now, assume we swap via Curve or similar
-            // uint256 ethReceived = _swapStethToEth(stethAmount);
-
-            // 3. Wrap ETH to WETH
-            // callForwarder.doCallWithValue(
-            //     address(WETH),
-            //     abi.encodeWithSelector(WETH.deposit.selector),
-            //     ethReceived
-            // );
-
-            // 4. Approve and repay debt to Morpho
-            callForwarder.doCall(
-                address(WETH),
-                abi.encodeWithSelector(WETH.approve.selector, address(MORPHO), type(uint256).max)
-            );
-
-            callForwarder.doCall(
-                address(MORPHO),
-                abi.encodeCall(MORPHO.repay, (getMarketParams(), 0, debtAmount, address(callForwarder), new bytes(0)))
-            );
+            console.log("Unwrapped remaining wstETH to stETH");
         }
+
+        // 6. Request pool withdrawal
+        requestId = _requestPoolWithdrawal(msg.sender, callForwarder);
+
+        emit ExitRequested(msg.sender, requestId, pos.collateral, pos.borrowShares);
+        emit StrategyExitRequested(msg.sender, requestId, _wsteth, _params);
+
+        console.log("=== requestExitByWsteth complete ===");
+    }
+
+    /**
+     * @notice Requests withdrawal from the pool after position exit
+     * @param _user The user requesting withdrawal
+     * @param _callForwarder The user's call forwarder
+     * @return requestId The withdrawal request ID as bytes32
+     */
+    function _requestPoolWithdrawal(
+        address _user,
+        IStrategyCallForwarder _callForwarder
+    ) internal returns (bytes32 requestId) {
+        // 1. Get stv balance
+        uint256 stvBalance = POOL_.balanceOf(address(_callForwarder));
+        console.log("STV balance for withdrawal:", stvBalance);
+
+        // 2. Get minted stETH shares that need rebalancing
+        uint256 mintedShares = POOL_.mintedStethSharesOf(address(_callForwarder));
+        console.log("Minted stETH shares to rebalance:", mintedShares);
+
+        if (stvBalance == 0) {
+            // Nothing to withdraw
+            return bytes32(0);
+        }
+
+        // 3. Request withdrawal with rebalancing
+        // This handles: burning stv, rebalancing stETH liability
+        bytes memory data = _callForwarder.doCall(
+            address(POOL_.WITHDRAWAL_QUEUE()),
+            abi.encodeWithSelector(
+                WithdrawalQueue.requestWithdrawal.selector,
+                _user, // recipient
+                stvBalance, // stv to withdraw
+                mintedShares // stETH shares to rebalance
+            )
+        );
+
+        uint256 poolRequestId = abi.decode(data, (uint256));
+        requestId = bytes32(poolRequestId);
+        console.log("Pool withdrawal request ID:", poolRequestId);
     }
 
     // TODO: Implement deleverage logic here.

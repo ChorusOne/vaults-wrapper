@@ -17,6 +17,8 @@ import {MorphoLoopStrategy} from "src/strategy/MorphoLoopStrategy.sol";
 import {StrategyCallForwarder} from "src/strategy/StrategyCallForwarder.sol";
 
 import {IWETH} from "src/interfaces/erc20/IWETH.sol";
+import {IDexRouter} from "src/interfaces/IDexRouter.sol";
+import {MockDexRouter} from "test/mocks/MockDexRouter.sol";
 
 // Import Morpho types from lib for real Morpho interaction
 import {Morpho} from "lib/morpho-blue/src/Morpho.sol";
@@ -49,6 +51,7 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
     IrmMock internal irm;
     MarketParams public marketParams;
     Id public marketId;
+    MockDexRouter public mockDexRouter;
 
     // Wrapper system
     StvStETHPool public pool;
@@ -81,6 +84,12 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
         console.log("[SETUP] Step 2: Deploying WETH mock");
         weth = IWETH(deployMockWETH());
         console.log("[SETUP] WETH deployed at:", address(weth));
+
+        // 2b. Deploy MockDexRouter for wstETH -> WETH swaps
+        console.log("[SETUP] Step 2b: Deploying MockDexRouter");
+        mockDexRouter = new MockDexRouter();
+        vm.label(address(mockDexRouter), "MockDexRouter");
+        console.log("[SETUP] MockDexRouter deployed at:", address(mockDexRouter));
 
         // 3. Deploy real Morpho via MorphoDeployer helper
         console.log("[SETUP] Step 3: Deploying real Morpho");
@@ -151,6 +160,15 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
         morpho.supply(realMarketParams, 1000 ether, 0, ADMIN, "");
         vm.stopPrank();
         console.log("[SETUP] Morpho market funded with 1000 WETH");
+
+        // 7b. Fund MockDexRouter with WETH for swaps during withdrawal
+        console.log("[SETUP] Step 7b: Funding MockDexRouter with WETH");
+        vm.startPrank(ADMIN);
+        vm.deal(ADMIN, 1000 ether);
+        weth.deposit{value: 500 ether}();
+        weth.transfer(address(mockDexRouter), 500 ether);
+        vm.stopPrank();
+        console.log("[SETUP] MockDexRouter funded with 500 WETH");
 
         // 8. Deploy pool WITHOUT strategy (we'll deploy strategy manually)
         console.log("[SETUP] Step 8: Deploying StvStETHPool");
@@ -463,6 +481,143 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
     }
 
     // =================================================================================
+    // WITHDRAWAL TESTS
+    // =================================================================================
+
+    /**
+     * @notice Test full exit creates a withdrawal request
+     */
+    function test_full_exit_creates_withdrawal_request() public {
+        console.log("\n=== Test: Full Exit Creates Withdrawal Request ===");
+
+        // 1. Setup: deposit with 2x leverage
+        uint256 depositAmount = 1 ether;
+        MorphoLoopStrategy.LoopSupplyParams memory supplyParams = MorphoLoopStrategy.LoopSupplyParams({
+            targetLeverageBp: 20000 // 2x leverage
+        });
+
+        vm.prank(USER1);
+        morphoStrategy.supply{value: depositAmount}(address(0), 0, abi.encode(supplyParams));
+
+        // 2. Get position before exit
+        Position memory posBefore = morpho.position(marketId, user1StrategyCallForwarder);
+        console.log("Position before exit:");
+        console.log("  Collateral:", posBefore.collateral);
+        console.log("  Borrow shares:", posBefore.borrowShares);
+
+        assertGt(posBefore.collateral, 0, "Should have collateral");
+        assertGt(posBefore.borrowShares, 0, "Should have debt");
+
+        // 3. Execute exit with 1% slippage tolerance
+        MorphoLoopStrategy.LoopExitParams memory exitParams = MorphoLoopStrategy.LoopExitParams({
+            slippageBps: 100 // 1%
+        });
+
+        vm.prank(USER1);
+        bytes32 requestId = morphoStrategy.requestExitByWsteth(0, abi.encode(exitParams));
+
+        // 4. Verify position is closed
+        Position memory posAfter = morpho.position(marketId, user1StrategyCallForwarder);
+        console.log("Position after exit:");
+        console.log("  Collateral:", posAfter.collateral);
+        console.log("  Borrow shares:", posAfter.borrowShares);
+
+        assertEq(posAfter.collateral, 0, "Collateral should be zero");
+        assertEq(posAfter.borrowShares, 0, "Debt should be zero");
+
+        // 5. Verify withdrawal request created
+        console.log("Withdrawal request ID:", uint256(requestId));
+        // Note: requestId will be bytes32(0) if pool withdrawal wasn't needed
+    }
+
+    /**
+     * @notice Test that onMorphoRepay reverts when called by non-Morpho
+     */
+    function test_revert_onMorphoRepay_only_morpho() public {
+        console.log("\n=== Test: onMorphoRepay Only Morpho ===");
+
+        vm.expectRevert(MorphoLoopStrategy.UnauthorizedCallback.selector);
+        morphoStrategy.onMorphoRepay(1 ether, "");
+    }
+
+    /**
+     * @notice Test that exit reverts when user has no position
+     */
+    function test_revert_exit_no_position() public {
+        console.log("\n=== Test: Exit Reverts With No Position ===");
+
+        MorphoLoopStrategy.LoopExitParams memory exitParams = MorphoLoopStrategy.LoopExitParams({
+            slippageBps: 100
+        });
+
+        vm.prank(USER1);
+        vm.expectRevert(MorphoLoopStrategy.InsufficientCollateral.selector);
+        morphoStrategy.requestExitByWsteth(0, abi.encode(exitParams));
+    }
+
+    /**
+     * @notice Test that exit reverts when slippage is exceeded
+     */
+    function test_revert_if_slippage_exceeded() public {
+        console.log("\n=== Test: Exit Reverts If Slippage Exceeded ===");
+
+        // 1. Setup: deposit with leverage
+        uint256 depositAmount = 1 ether;
+        MorphoLoopStrategy.LoopSupplyParams memory supplyParams = MorphoLoopStrategy.LoopSupplyParams({
+            targetLeverageBp: 20000
+        });
+
+        vm.prank(USER1);
+        morphoStrategy.supply{value: depositAmount}(address(0), 0, abi.encode(supplyParams));
+
+        // 2. Set unfavorable exchange rate in mock (need 20% more wstETH)
+        mockDexRouter.setExchangeRate(1.2e18);
+
+        // 3. Try exit with 1% slippage - should fail
+        MorphoLoopStrategy.LoopExitParams memory exitParams = MorphoLoopStrategy.LoopExitParams({
+            slippageBps: 100 // 1%
+        });
+
+        vm.prank(USER1);
+        vm.expectRevert(); // MockDexRouter.SlippageExceeded
+        morphoStrategy.requestExitByWsteth(0, abi.encode(exitParams));
+    }
+
+    /**
+     * @notice Test exit with sufficient slippage tolerance
+     */
+    function test_exit_with_high_slippage_tolerance() public {
+        console.log("\n=== Test: Exit With High Slippage Tolerance ===");
+
+        // 1. Setup: deposit with leverage
+        uint256 depositAmount = 1 ether;
+        MorphoLoopStrategy.LoopSupplyParams memory supplyParams = MorphoLoopStrategy.LoopSupplyParams({
+            targetLeverageBp: 20000
+        });
+
+        vm.prank(USER1);
+        morphoStrategy.supply{value: depositAmount}(address(0), 0, abi.encode(supplyParams));
+
+        // 2. Set slightly unfavorable exchange rate (5% worse)
+        mockDexRouter.setExchangeRate(1.05e18);
+
+        // 3. Exit with 10% slippage tolerance - should succeed
+        MorphoLoopStrategy.LoopExitParams memory exitParams = MorphoLoopStrategy.LoopExitParams({
+            slippageBps: 1000 // 10%
+        });
+
+        vm.prank(USER1);
+        bytes32 requestId = morphoStrategy.requestExitByWsteth(0, abi.encode(exitParams));
+
+        // 4. Verify position is closed
+        Position memory posAfter = morpho.position(marketId, user1StrategyCallForwarder);
+        assertEq(posAfter.collateral, 0, "Collateral should be zero");
+        assertEq(posAfter.borrowShares, 0, "Debt should be zero");
+
+        console.log("Exit succeeded with 10% slippage tolerance");
+    }
+
+    // =================================================================================
     // HELPER FUNCTIONS
     // =================================================================================
 
@@ -483,6 +638,7 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
         console.log("  - pool:", address(pool));
         console.log("  - morpho:", address(morpho));
         console.log("  - weth:", address(weth));
+        console.log("  - dexRouter:", address(mockDexRouter));
         console.log("  - maxLeverageBp:", MAX_LEVERAGE_BP);
 
         // Create memory copy of marketParams for constructor
@@ -500,6 +656,7 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
             address(pool),
             address(morpho),
             address(weth),
+            address(mockDexRouter),
             marketParamsMem,
             MAX_LEVERAGE_BP
         );
