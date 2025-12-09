@@ -141,8 +141,8 @@ contract CoreHarness is Test {
             IOperatorGrid.TierParams[] memory params = new IOperatorGrid.TierParams[](1);
             params[0] = IOperatorGrid.TierParams({
                 shareLimit: 10_000 ether,
-                reserveRatioBP: 10000,
-                forcedRebalanceThresholdBP: 9750,
+                reserveRatioBP: 1000, // 10% reserve ratio -> 90% LTV for stETH minting
+                forcedRebalanceThresholdBP: 975, // Must be less than reserveRatioBP
                 infraFeeBP: tier.infraFeeBP,
                 liquidityFeeBP: tier.liquidityFeeBP,
                 reservationFeeBP: tier.reservationFeeBP
