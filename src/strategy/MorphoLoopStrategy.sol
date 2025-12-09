@@ -618,9 +618,29 @@ contract MorphoLoopStrategy is
                 abi.encodeWithSelector(WSTETH.unwrap.selector, remainingWsteth)
             );
             console.log("Unwrapped remaining wstETH to stETH");
+
+            // 5b. Burn the stETH to reduce minted shares liability
+            // This ensures we don't over-rebalance in the withdrawal request
+            uint256 stethBalance = STETH.sharesOf(address(callForwarder));
+            console.log("stETH shares to burn:", stethBalance);
+
+            if (stethBalance > 0) {
+                // Approve stETH to pool
+                callForwarder.doCall(
+                    address(STETH),
+                    abi.encodeWithSelector(STETH.approve.selector, address(POOL_), stethBalance)
+                );
+                // Burn stETH to reduce mintedStethSharesOf
+                callForwarder.doCall(
+                    address(POOL_),
+                    abi.encodeWithSelector(POOL_.burnStethShares.selector, stethBalance)
+                );
+                console.log("Burned stETH shares to reduce liability");
+            }
         }
 
         // 6. Request pool withdrawal
+        // Now mintedStethSharesOf reflects only the remaining liability (not covered by stETH)
         requestId = _requestPoolWithdrawal(msg.sender, callForwarder);
 
         emit ExitRequested(msg.sender, requestId, pos.collateral, pos.borrowShares);

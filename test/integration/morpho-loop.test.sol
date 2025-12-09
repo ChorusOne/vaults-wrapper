@@ -493,7 +493,7 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
         // 1. Setup: deposit with 2x leverage
         uint256 depositAmount = 1 ether;
         MorphoLoopStrategy.LoopSupplyParams memory supplyParams = MorphoLoopStrategy.LoopSupplyParams({
-            targetLeverageBp: 20000 // 2x leverage
+            targetLeverageBp: 30000 // 3x leverage
         });
 
         vm.prank(USER1);
