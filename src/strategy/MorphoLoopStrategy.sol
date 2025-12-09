@@ -472,17 +472,16 @@ contract MorphoLoopStrategy is
         console.log("=== onMorphoRepay callback ===");
         console.log("Repaid assets (WETH needed):", repaidAssets);
 
-        // 1. Validate caller is Morpho
-        if (msg.sender != address(MORPHO)) revert UnauthorizedCallback();
-
-        // 2. Validate callback context
+        // 1. Validate callback context
         CallbackContext memory ctx = _callbackContext;
         if (ctx.callBackFrom == address(0)) revert NoActiveContext();
         if (ctx.callbackType != MorphoCallback.OnMorphoRepay) revert InvalidMorphoCallback();
 
+        // 2. Validate caller is the callForwarder (callback is forwarded from forwarder)
+        if (msg.sender != ctx.callBackFrom) revert UnauthorizedCallback();
+
         // 3. Decode callback data
         RepayCallbackData memory cbData = abi.decode(data, (RepayCallbackData));
-        IStrategyCallForwarder callForwarder = IStrategyCallForwarder(cbData.callForwarder);
 
         // 4. Get current collateral amount and withdraw ALL from Morpho
         Position memory pos = MORPHO.position(MARKET_ID, cbData.callForwarder);
@@ -526,11 +525,18 @@ contract MorphoLoopStrategy is
             console.log("Transferred remaining wstETH to callForwarder");
         }
 
-        // 9. Approve WETH to Morpho for repayment
-        WETH.approve(address(MORPHO), repaidAssets);
-        console.log("Approved WETH to Morpho for repayment");
+        // 9. Transfer WETH to callForwarder (Morpho pulls from msg.sender which is forwarder)
+        WETH.transfer(cbData.callForwarder, repaidAssets);
+        console.log("Transferred WETH to callForwarder for Morpho repayment");
 
-        // Morpho will pull the WETH after this callback returns
+        // 10. Approve WETH from callForwarder to Morpho
+        IStrategyCallForwarder(cbData.callForwarder).doCall(
+            address(WETH),
+            abi.encodeWithSelector(WETH.approve.selector, address(MORPHO), repaidAssets)
+        );
+        console.log("Approved WETH to Morpho from callForwarder");
+
+        // Morpho will pull the WETH from callForwarder after this callback returns
         console.log("=== onMorphoRepay callback complete ===");
     }
 
@@ -581,8 +587,9 @@ contract MorphoLoopStrategy is
 
         // 4. Execute repay with callback (repays ALL debt using shares)
         // The callback will withdraw collateral, swap to WETH, and approve for repayment
+        // NOTE: We call via callForwarder so Morpho calls back to forwarder, which forwards to strategy
         if (pos.borrowShares > 0) {
-            console.log("Calling Morpho.repay with callback");
+            console.log("Calling Morpho.repay with callback via callForwarder");
             callForwarder.doCall(
                 address(MORPHO),
                 abi.encodeCall(

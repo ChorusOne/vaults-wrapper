@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0
+// SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -6,6 +6,7 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {
+    IMorphoRepayCallback,
     IMorphoSupplyCallback,
     IMorphoSupplyCollateralCallback
 } from "lib/morpho-blue/src/interfaces/IMorphoCallbacks.sol";
@@ -16,7 +17,8 @@ contract StrategyCallForwarder is
     ReentrancyGuardUpgradeable,
     OwnableUpgradeable,
     IStrategyCallForwarder,
-    IMorphoSupplyCollateralCallback
+    IMorphoSupplyCollateralCallback,
+    IMorphoRepayCallback
 {
     constructor() {
         _disableInitializers();
@@ -72,6 +74,17 @@ contract StrategyCallForwarder is
 
         // Forward the callback to the owner (strategy)
         bytes memory callData = abi.encodeCall(IMorphoSupplyCollateralCallback.onMorphoSupplyCollateral, (amount, data));
+
+        // Forward the callback to the owner (strategy)
+        Address.functionCall(owner(), callData);
+    }
+
+    function onMorphoRepay(uint256 assets, bytes calldata data) external {
+        // TODO: Add some form of checking.
+        // if (msg.sender != address(MORPHO)) revert UnauthorizedCallback();
+
+        // Forward the callback to the owner (strategy)
+        bytes memory callData = abi.encodeCall(IMorphoRepayCallback.onMorphoRepay, (assets, data));
 
         // Forward the callback to the owner (strategy)
         Address.functionCall(owner(), callData);

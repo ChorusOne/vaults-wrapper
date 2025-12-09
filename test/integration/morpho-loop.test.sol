@@ -508,6 +508,8 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
         assertGt(posBefore.collateral, 0, "Should have collateral");
         assertGt(posBefore.borrowShares, 0, "Should have debt");
 
+        // Check Lido position before
+
         // 3. Execute exit with 1% slippage tolerance
         MorphoLoopStrategy.LoopExitParams memory exitParams = MorphoLoopStrategy.LoopExitParams({
             slippageBps: 100 // 1%
@@ -516,7 +518,9 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
         vm.prank(USER1);
         bytes32 requestId = morphoStrategy.requestExitByWsteth(0, abi.encode(exitParams));
 
-        // 4. Verify position is closed
+        // Check Lido position after.
+
+        // 4. Verify Morpho position is closed
         Position memory posAfter = morpho.position(marketId, user1StrategyCallForwarder);
         console.log("Position after exit:");
         console.log("  Collateral:", posAfter.collateral);
@@ -527,16 +531,37 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
 
         // 5. Verify withdrawal request created
         console.log("Withdrawal request ID:", uint256(requestId));
+        assertEq(uint256(requestId), 1, "withdraw request ID should be 1");
         // Note: requestId will be bytes32(0) if pool withdrawal wasn't needed
+
+        // Get the call forwarder address for USER1.
+        IStrategyCallForwarder callForwarder = morphoStrategy.getStrategyCallForwarderAddress(USER1);
+
+        // Check that we have a pending withdrawal request in the withdrawal queue.
+        uint256[] memory withdrawals = withdrawalQueue.withdrawalRequestsOf(USER1);
+        assertEq(withdrawals.length, 1, "withdrawal queue should have 1 withdrawal request");
+        assertEq(withdrawals[0], 1, "the withdrawal should have ID 1");
+
+        // Withdrawal queue data
+        WithdrawalQueue.WithdrawalRequestStatus memory withdrawalStatus = withdrawalQueue.getWithdrawalStatus(
+            withdrawals[0]
+        );
+        console.log("amountOfStv: ", withdrawalStatus.amountOfStv);
+        console.log("amountOfStethShares: ", withdrawalStatus.amountOfStethShares);
+        console.log("amountOfAssets: ", withdrawalStatus.amountOfAssets);
+        console.log("owner: ", withdrawalStatus.owner);
+        console.log("timestamp: ", withdrawalStatus.timestamp);
+        console.log("isFinalized: ", withdrawalStatus.isFinalized);
+        console.log("isClaimed: ", withdrawalStatus.isClaimed);
     }
 
     /**
-     * @notice Test that onMorphoRepay reverts when called by non-Morpho
+     * @notice Test that onMorphoRepay reverts when called without active context
      */
-    function test_revert_onMorphoRepay_only_morpho() public {
-        console.log("\n=== Test: onMorphoRepay Only Morpho ===");
+    function test_revert_onMorphoRepay_no_context() public {
+        console.log("\n=== Test: onMorphoRepay No Context ===");
 
-        vm.expectRevert(MorphoLoopStrategy.UnauthorizedCallback.selector);
+        vm.expectRevert(MorphoLoopStrategy.NoActiveContext.selector);
         morphoStrategy.onMorphoRepay(1 ether, "");
     }
 
@@ -546,9 +571,7 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
     function test_revert_exit_no_position() public {
         console.log("\n=== Test: Exit Reverts With No Position ===");
 
-        MorphoLoopStrategy.LoopExitParams memory exitParams = MorphoLoopStrategy.LoopExitParams({
-            slippageBps: 100
-        });
+        MorphoLoopStrategy.LoopExitParams memory exitParams = MorphoLoopStrategy.LoopExitParams({slippageBps: 100});
 
         vm.prank(USER1);
         vm.expectRevert(MorphoLoopStrategy.InsufficientCollateral.selector);
