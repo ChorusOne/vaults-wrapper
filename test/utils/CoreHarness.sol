@@ -138,16 +138,16 @@ contract CoreHarness is Test {
 
         IOperatorGrid.Tier memory tier = operatorGrid.tier(DEFAULT_TIER_ID);
         if (tier.shareLimit == 0) {
-            // // On pre-deployed cores (like Hoodi), the Agent has DEFAULT_ADMIN_ROLE but not
-            // // TIER_MANAGER_ROLE. We need to grant the role first before calling alterTiers.
-            // bytes32 TIER_MANAGER_ROLE = 0xa495a3428837724c7f7648cda02eb83c9c4c778c8688d6f254c7f3f80c154d55;
-            // IAccessControl ogAccess = IAccessControl(address(operatorGrid));
+            // On pre-deployed cores (like Hoodi), the Agent has DEFAULT_ADMIN_ROLE but not
+            // TIER_MANAGER_ROLE. We need to grant the role first before calling alterTiers.
+            bytes32 TIER_MANAGER_ROLE = keccak256("vaults.OperatorsGrid.Registry");
+            IAccessControl ogAccess = IAccessControl(address(operatorGrid));
 
-            // // Grant TIER_MANAGER_ROLE to Agent if it doesn't have it
-            // if (!ogAccess.hasRole(TIER_MANAGER_ROLE, agent)) {
-            //     vm.prank(agent);
-            //     try ogAccess.grantRole(TIER_MANAGER_ROLE, agent) {} catch {}
-            // }
+            // Grant TIER_MANAGER_ROLE to Agent if it doesn't have it
+            if (!ogAccess.hasRole(TIER_MANAGER_ROLE, agent)) {
+                vm.prank(agent);
+                ogAccess.grantRole(TIER_MANAGER_ROLE, agent);
+            }
 
             IOperatorGrid.TierParams[] memory params = new IOperatorGrid.TierParams[](1);
             params[0] = IOperatorGrid.TierParams({
@@ -164,7 +164,6 @@ contract CoreHarness is Test {
 
             vm.prank(agent);
             operatorGrid.alterTiers(tierIds, params);
-            // try operatorGrid.alterTiers(tierIds, params) {} catch {}
         }
 
         vaultHub = IVaultHub(locator.vaultHub());
