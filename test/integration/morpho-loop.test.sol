@@ -553,6 +553,50 @@ contract MorphoLoopStrategyTest is StvStrategyPoolHarness {
         console.log("timestamp: ", withdrawalStatus.timestamp);
         console.log("isFinalized: ", withdrawalStatus.isFinalized);
         console.log("isClaimed: ", withdrawalStatus.isClaimed);
+        assertEq(withdrawalStatus.owner, USER1, "Should not be finalized yet");
+        assertFalse(withdrawalStatus.isFinalized, "Should not be finalized yet");
+        assertFalse(withdrawalStatus.isClaimed, "Should not be claimed yet");
+
+        // 6. Advance time past min delay and refresh vault report
+        console.log("\n=== Finalization Phase ===");
+        _advancePastMinDelayAndRefreshReport(ctx, uint256(requestId));
+        console.log("Time advanced past min delay, vault report refreshed");
+
+        // 7. Node operator finalizes the withdrawal
+        vm.prank(NODE_OPERATOR);
+        withdrawalQueue.finalize(1, address(0));
+        console.log("Withdrawal finalized by node operator");
+
+        // 8. Verify request is finalized
+        WithdrawalQueue.WithdrawalRequestStatus memory statusAfterFinalize = withdrawalQueue.getWithdrawalStatus(
+            uint256(requestId)
+        );
+        assertTrue(statusAfterFinalize.isFinalized, "Should be finalized");
+        assertFalse(statusAfterFinalize.isClaimed, "Should not be claimed yet");
+        console.log("isFinalized after finalize:", statusAfterFinalize.isFinalized);
+
+        // 9. User claims the withdrawal
+        console.log("\n=== Claim Phase ===");
+        uint256 user1BalanceBefore = USER1.balance;
+        console.log("USER1 ETH balance before claim:", user1BalanceBefore);
+
+        vm.prank(USER1);
+        uint256 claimedEth = withdrawalQueue.claimWithdrawal(USER1, uint256(requestId));
+        console.log("Claimed ETH:", claimedEth);
+
+        // 10. Verify ETH received
+        assertGt(claimedEth, 0, "Should have claimed some ETH");
+        assertEq(USER1.balance, user1BalanceBefore + claimedEth, "ETH balance should increase");
+        console.log("USER1 ETH balance after claim:", USER1.balance);
+
+        // 11. Verify request is claimed
+        WithdrawalQueue.WithdrawalRequestStatus memory statusAfterClaim = withdrawalQueue.getWithdrawalStatus(
+            uint256(requestId)
+        );
+        assertTrue(statusAfterClaim.isClaimed, "Should be claimed");
+        console.log("isClaimed after claim:", statusAfterClaim.isClaimed);
+
+        console.log("\n=== Full E2E Withdrawal Complete ===");
     }
 
     /**
